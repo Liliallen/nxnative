@@ -22,6 +22,7 @@ static void hc_write(void) {
     for (int k = 0; k < 256; k++) if (atomic_load(&g_hsvc[k])) fprintf(f, "SVC\t%#x\t%llu\n", k, (unsigned long long)atomic_load(&g_hsvc[k]));
     fclose(f); LOG("DM_HLECOUNT：%u 条入口 → %s", g_nhc, pth);
 }
+void hlecount_dump(void) { if (hc_on() && g_hcode) hc_write(); }
 void *hlecount_wrap(const char *kind, const char *name, void *fn) {
     if (!hc_on() || !fn) return fn;
     if (g_hsealed) { static int once; if (!once++) LOG("【红】DM_HLECOUNT：封页后还有解析（%s），此后的入口不计数", name); return fn; }

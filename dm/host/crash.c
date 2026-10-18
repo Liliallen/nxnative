@@ -146,6 +146,9 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         _exit(128 + sig);
     }
     funlockfile(stderr);
+#if !TARGET_OS_IPHONE
+    { void hlecount_dump(void); hlecount_dump(); }   // DM_HLECOUNT: the counts are also wanted from runs that crash or hit the time limit
+#endif
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
     fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);

@@ -932,8 +932,9 @@ static pthread_mutex_t g_susp_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_susp_cv = PTHREAD_COND_INITIALIZER;
 static int g_susp, g_inflight_api;
 __thread _Atomic int dm_host_work;   // see hle.h (defined here: the graphics unit tests compile this file but not hle_thread.c)
-static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); dm_host_work++; }
-static void gfx_leave(void) { dm_host_work--; pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
+void dm_core_host_work(int enter) __attribute__((weak));   // hle_thread.c (absent in the graphics unit tests)
+static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pthread_cond_wait(&g_susp_cv, &g_susp_mu); g_inflight_api++; pthread_mutex_unlock(&g_susp_mu); if (!dm_host_work++ && dm_core_host_work) dm_core_host_work(1); }
+static void gfx_leave(void) { if (!--dm_host_work && dm_core_host_work) dm_core_host_work(0); pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
 void dm_gfx_enter(void) { gfx_enter(); }   // the same gate for the Vulkan layer's submits and presents (dm/gfx/vk)
 void dm_gfx_leave(void) { gfx_leave(); }
 __attribute__((weak)) void dm_vk_drain(void) {}   // dm/gfx/vk/hle_vk.m: wait for the Vulkan layer's queue (the graphics unit tests do not link it)
@@ -1422,8 +1423,17 @@ NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *buf, const NVNbufferBuilder *b) 
 }
 NVN(nvnBufferFinalize, void, NVNbuffer *buf) { ((buf_t *)buf)->magic = 0; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *buf, const char *s) { (void)buf; (void)s; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off); }
-NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return BF(buf)->pool->mem + BF(buf)->off; }
+// A finalized buffer whose memory the game has reused reads back as garbage on hardware (the driver keeps the address
+// in the object), not as a crash: Breath of the Wild 1.6.0 walks a list with such stale entries. Without the buffer
+// magic, answer 0 instead of following the reused memory as a pool pointer.
+static int buf_live(const NVNbuffer *buf) {
+    if (BF(buf)->magic == MAGIC('B', 'U', 'F', 0)) return 1;
+    static int warned;
+    if (!warned++) LOG("【黄】BufferGetAddress/Map：对象 %p 不是活的缓冲（magic %#x），给 0 | not a live buffer, answering 0", (const void *)buf, BF(buf)->magic);
+    return 0;
+}
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *buf) { return buf_live(buf) ? (NVNbufferAddress)(BF(buf)->pool->mem + BF(buf)->off) : 0; }
+NVN(nvnBufferMap, void *, const NVNbuffer *buf) { return buf_live(buf) ? BF(buf)->pool->mem + BF(buf)->off : NULL; }
 NVN(nvnBufferGetSize, size_t, const NVNbuffer *buf) { return (size_t)BF(buf)->size; }
 NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *buf) { return (NVNmemoryPool *)BF(buf)->pool; }
 NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *buf) { return (ptrdiff_t)BF(buf)->off; }
