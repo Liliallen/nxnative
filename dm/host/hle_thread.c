@@ -225,9 +225,13 @@ static void core_acquire(struct thr *t) {
     else {
         if (g_core[c].nwait >= 64) die("核等待队列满");
         t->cticket = ++g_core[c].ticket; t->ccore = c; g_core[c].wait[g_core[c].nwait++] = t;
-        struct thr *h = g_core[c].holder;
-        if (t->prio < h->prio && !atomic_exchange(&h->cpreempt, 1)) pthread_kill(h->pt, SIGUSR1);
-        while (g_core[c].holder != t) pthread_cond_wait(&t->ccv, &g_core[c].mu);
+        // A lower-priority holder is preempted: the signal stops it only in guest code, so it is resent every 100 µs while the holder is in host code
+        while (g_core[c].holder != t) {
+            struct thr *h = g_core[c].holder;
+            if (h && t->prio < h->prio) { atomic_store(&h->cpreempt, 1); pthread_kill(h->pt, SIGUSR1); }
+            struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+            pthread_cond_timedwait(&t->ccv, &g_core[c].mu, &dl);
+        }
     }
     pthread_mutex_unlock(&g_core[c].mu);
     atomic_store(&t->cpreempt, 0); t_core_held = c;
