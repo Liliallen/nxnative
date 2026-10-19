@@ -210,6 +210,21 @@ static void ub_heads(uint64_t var) {   // for each rebuild of var in the ring: t
             fprintf(stderr, "[dm]     H %.6fs head=%#llx unit=%#llx idx=%u\n", (e->ns - g_t0_ns) / 1e9, (unsigned long long)e->var, (unsigned long long)e->arr, e->cnt);
             if (hs == 1) ub_adds(e->var); } }
 }
+static void ubr_probe(ucontext_t *uc) {   // item release main+0x1297080(x0 owner, x1 item): var = item, arr = caller (lr), cnt = [item+0x191] << 8 | flags
+    uint64_t *x = uc->uc_mcontext->__ss.__x, f = 0; rd64(x[1] + 0x190, &f); ub_note('L', x[1], uc->uc_mcontext->__ss.__lr, (uint32_t)(f >> 8 & 0xff));
+}
+void probe_crash_dump(ucontext_t *uc);
+void probe_crash_dump(ucontext_t *uc) {   // crash.c: the ring's events for any object a crash register points at (only with DM_PROBE_UBLIST)
+    if (!getenv("DM_PROBE_UBLIST")) return;
+    extern uint64_t g_t0_ns; uint64_t n = atomic_load(&g_ring_n), lo = n > UB_RING ? n - UB_RING : 0;
+    for (int r = 19; r <= 28; r++) {
+        uint64_t v = uc->uc_mcontext->__ss.__x[r]; if (v < 0x1000000) continue; int k = 0;
+        for (uint64_t i = n; i-- > lo && k < 12;) { ub_ev *e = &g_ring[i & (UB_RING - 1)]; if (e->var != v) continue;
+            if (!k++) fprintf(stderr, "[dm] 环形事件 x%d=%#llx | ring events:\n", r, (unsigned long long)v);
+            module_t *m = module_of((void *)e->arr);
+            fprintf(stderr, "[dm]   %c %.6fs T=%x 帧 %u %s+%#llx 标志 %#x\n", e->kind, (e->ns - g_t0_ns) / 1e9, e->thr, e->frame, m ? m->name : "?", (unsigned long long)(m ? e->arr - (uint64_t)m->base : e->arr), e->cnt); }
+    }
+}
 static void ubw_probe(ucontext_t *uc) { ub_note('W', uc->uc_mcontext->__ss.__x[23], uc->uc_mcontext->__ss.__x[8], 0); }
 enum { UB_H = 1 << 16 };
 static struct { uint64_t obj, var, arr, first, frame; } g_ub[UB_H];
@@ -262,7 +277,7 @@ static void ub_install(void) {
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) {
         if (strcmp(g_mod[i].build_id, "8e9978d50bdd20b4c8395a106c27ffde")) { LOG("DM_PROBE_UBLIST：只认 BotW 1.6.0 main"); return; }
         ub_main_lo = (uint64_t)g_mod[i].base; ub_main_hi = ub_main_lo + g_mod[i].size;
-        if (getenv("DM_PROBE_UBLIST")) { probe_add(&g_mod[i], 0x14ef440, -1, ub_probe); probe_add(&g_mod[i], 0x14e88a8, -1, ubw_probe); probe_add(&g_mod[i], 0x139e834, -1, ubh_probe); probe_add(&g_mod[i], 0x139e67c, -1, uba_probe); }
+        if (getenv("DM_PROBE_UBLIST")) { probe_add(&g_mod[i], 0x14ef440, -1, ub_probe); probe_add(&g_mod[i], 0x14e88a8, -1, ubw_probe); probe_add(&g_mod[i], 0x139e834, -1, ubh_probe); probe_add(&g_mod[i], 0x139e67c, -1, uba_probe); probe_add(&g_mod[i], 0x1297080, -1, ubr_probe); }
         if (getenv("DM_PROBE_CORE")) probe_add(&g_mod[i], 0x139e794, -1, core_probe);
     }
 }

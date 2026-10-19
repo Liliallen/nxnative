@@ -89,6 +89,8 @@ def header(g):
     vers = ', '.join('{' + q(b['main']) + ', ' + q(b['display']) + '}' for b in g.builds().values() if 'main' in b)
     pi = g.get('present_interval', 'game')   # present interval: game = as the game sets it (as on the Switch), display = one frame per display tick
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval 只能是 game / display | present_interval must be game or display: {pi}')
+    cl = g.get('core_lock', 'off')   # one running thread per guest core with Horizon's priority rules (hle_thread.c DM_CORE_LOCK): on / off
+    if cl not in ('on', 'off'): sys.exit(f'{g.id}: core_lock 只能是 on / off | core_lock must be on or off: {cl}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt 只能是 on / off | core_preempt must be on or off: {cp}')
     sf = g.get('shared_font', 'bfttf')   # what the shared-font address points at (hle_sdk16.c): bfttf = 8-byte header + TTF, ttf = the TTF alone
@@ -132,6 +134,7 @@ def header(g):
          f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
          f'#define DM_GAME_PRESENT_DISPLAY {int(pi == "display")}',
          f'#define DM_GAME_CORE_PREEMPT {int(cp == "on")}',
+         f'#define DM_GAME_CORE_LOCK {int(cl == "on")}',
          f'#define DM_GAME_SHARED_FONT_TTF {int(sf == "ttf")}',
          f'#define DM_GAME_PAD_FULL {int(pl == "full")}',
          f'#define DM_GAME_FEEDBACK_SNAP {q(" ".join(fbs))}',

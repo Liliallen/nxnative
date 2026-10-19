@@ -58,6 +58,9 @@ typedef struct thr {
     pthread_cond_t pcv;
     // Core scheduling (DM_CORE_LOCK): waiting for a core (ccore >= 0), its turn ticket, and a preemption request from a higher-priority waiter
     pthread_cond_t ccv; int ccore; uint64_t cticket; _Atomic int cpreempt;
+    uint64_t cw_ns, cw_n, cw_max, cb_ns, cp_n;
+    struct thr *yield_to;
+    int cboost;                // DM_CORE_LOCK priority inheritance: 0, or 1 + the best priority among threads waiting on a lock this thread holds (Horizon boosts lock owners)      // DM_CORE_LOCK: this SVC woke / started a higher-priority thread of this core: hand it the core before returning to guest code   // core stats: time / count / longest waiting for the core, time others waited on it as holder, preemptions sent to it
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
@@ -138,10 +141,13 @@ static thr_t *pick(int kind, uint64_t a) {
     }
     return b;
 }
+static void core_note_wake(thr_t *self, thr_t *t);
+static void boost_refresh(void);
 static void wake(thr_t *t, int64_t res) {
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
     thr_t *self = pthread_getspecific(g_keythr);   // the woken thread is pinned to this core with a higher priority: on Horizon it preempts at once (see dm_yield_to_core_peers)
     if (self && self != t && !t->host_owned && t->prio < self->prio && t->mask == 1ull << (self->core & 63)) self->yield_pending = 1;
+    core_note_wake(self, t);
 }
 // Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
 static int64_t block_inner(thr_t *t, int kind, int64_t ns);
@@ -157,6 +163,7 @@ static int64_t block(thr_t *t, int kind, int64_t ns) {   // Boot timeline: accum
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+    if (kind == 1) boost_refresh();
     core_yield();
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -181,6 +188,18 @@ static inline uint32_t ld32(uint64_t a) { return __atomic_load_n((uint32_t *)a, 
 static inline void st32(uint64_t a, uint32_t v) { __atomic_store_n((uint32_t *)a, v, __ATOMIC_SEQ_CST); }
 static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic_compare_exchange_n((uint32_t *)a, exp, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 
+// Priority inheritance for core scheduling (holding G): every lock owner takes the best priority among the threads waiting on its locks (one level)
+static int core_lock_on(void);
+static int eprio(const struct thr *t);
+static void boost_refresh(void) {
+    if (!core_lock_on()) return;
+    for (thr_t *t = g_all; t; t = t->all) t->cboost = 0;
+    for (thr_t *w = g_wait; w; w = w->next) {
+        if (w->wkind != 1) continue;
+        thr_t *o = h_peek(ld32(w->waddr) & ~WAITERS_BIT, O_THREAD); int p = eprio(w);
+        if (o && o != w && (!o->cboost || p + 1 < o->cboost)) o->cboost = p + 1;
+    }
+}
 // Release the lock at addr: hand it to the first thread waiting on it, or clear it to zero (holding G)
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
@@ -188,6 +207,7 @@ static void lock_handoff(uint64_t addr) {
     for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
+    boost_refresh();
 }
 // Make t take the lock at addr: if free, it gets it directly and is woken, otherwise set the waiters bit and turn into a lock wait (holding G)
 static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
@@ -198,6 +218,7 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
     }
     t->wkind = 1; t->waddr = addr; t->wtag = tag;      // Still in g_wait, changed to a lock wait
     t->wseq = ++g_wseq;                                  // The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
+    boost_refresh();
 }
 
 // ---------- Threads ----------
@@ -209,8 +230,10 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
 static struct { pthread_mutex_t mu; struct thr *holder; struct thr *wait[64]; int nwait; uint64_t ticket; } g_core[3] = {
     {PTHREAD_MUTEX_INITIALIZER}, {PTHREAD_MUTEX_INITIALIZER}, {PTHREAD_MUTEX_INITIALIZER}};
 static __thread int t_core_held = -1, t_core_lost;
-static int core_lock_on(void) { static int on = -1; if (on < 0) on = getenv("DM_CORE_LOCK") && atoi(getenv("DM_CORE_LOCK")); return on; }
-static int core_better(const struct thr *a, const struct thr *b) { return a->prio < b->prio || (a->prio == b->prio && a->cticket < b->cticket); }
+static int core_lock_on(void) { static int on = -1; if (on < 0) on = getenv("DM_CORE_LOCK") ? atoi(getenv("DM_CORE_LOCK")) : DM_GAME_CORE_LOCK; return on; }   // DM_CORE_LOCK overrides the profile key core_lock
+static int core_slot(const struct thr *t) { return core_lock_on() == 2 ? 0 : t->core >= 0 && t->core < 3 ? t->core : 0; }   // DM_CORE_LOCK=2 (diagnostic): one lock for every guest thread
+static int eprio(const struct thr *t) { int b = t->cboost; return b && b - 1 < t->prio ? b - 1 : t->prio; }
+static int core_better(const struct thr *a, const struct thr *b) { return eprio(a) < eprio(b) || (eprio(a) == eprio(b) && a->cticket < b->cticket); }
 static void core_handoff(int c) {   // holding g_core[c].mu: give the core to the best waiter, if any
     int bi = -1; for (int i = 0; i < g_core[c].nwait; i++) if (bi < 0 || core_better(g_core[c].wait[i], g_core[c].wait[bi])) bi = i;
     if (bi < 0) { g_core[c].holder = NULL; return; }
@@ -219,19 +242,22 @@ static void core_handoff(int c) {   // holding g_core[c].mu: give the core to th
 }
 static void core_acquire(struct thr *t) {
     if (!core_lock_on() || t->host_owned || t_core_held >= 0) return;
-    int c = t->core >= 0 && t->core < 3 ? t->core : 0;
+    int c = core_slot(t);
     pthread_mutex_lock(&g_core[c].mu);
     if (!g_core[c].holder) g_core[c].holder = t;
+    else if (g_core[c].holder == t) {}   // handed to it by the thread that woke it (core_handoff_to)
     else {
         if (g_core[c].nwait >= 64) die("核等待队列满");
         t->cticket = ++g_core[c].ticket; t->ccore = c; g_core[c].wait[g_core[c].nwait++] = t;
+        uint64_t w0 = now_ns(); struct thr *blk = g_core[c].holder;
         // A lower-priority holder is preempted: the signal stops it only in guest code, so it is resent every 100 µs while the holder is in host code
         while (g_core[c].holder != t) {
             struct thr *h = g_core[c].holder;
-            if (h && t->prio < h->prio) { atomic_store(&h->cpreempt, 1); pthread_kill(h->pt, SIGUSR1); }
+            if (h && eprio(t) < eprio(h)) { atomic_store(&h->cpreempt, 1); pthread_kill(h->pt, SIGUSR1); h->cp_n++; }
             struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
             pthread_cond_timedwait(&t->ccv, &g_core[c].mu, &dl);
         }
+        uint64_t d = now_ns() - w0; t->cw_ns += d; t->cw_n++; if (d > t->cw_max) t->cw_max = d; if (blk) blk->cb_ns += d;
     }
     pthread_mutex_unlock(&g_core[c].mu);
     atomic_store(&t->cpreempt, 0); t_core_held = c;
@@ -244,19 +270,38 @@ static void core_release(void) {
 static int core_yield_peers(struct thr *t) {
     int c = t_core_held; if (c < 0) return 0;
     pthread_mutex_lock(&g_core[c].mu);
-    int any = 0; for (int i = 0; i < g_core[c].nwait; i++) any |= g_core[c].wait[i]->prio <= t->prio;
+    int any = 0; for (int i = 0; i < g_core[c].nwait; i++) any |= eprio(g_core[c].wait[i]) <= eprio(t);
     if (any) { core_handoff(c); t_core_held = -1; }
     pthread_mutex_unlock(&g_core[c].mu);
     return any;
 }
 static void core_yield(void) { if (t_core_held >= 0) { core_release(); t_core_lost = 1; } }
+// Horizon: a thread that wakes or starts a higher-priority thread of its own core loses the core when the SVC returns. Called holding G (wake / StartThread)
+static void core_note_wake(thr_t *self, thr_t *t) {
+    if (!self || self == t || t->host_owned || self->host_owned || !core_lock_on() || t_core_held < 0) return;
+    int c = core_slot(t);
+    if (c != t_core_held || eprio(t) >= eprio(self)) return;
+    if (!self->yield_to || eprio(t) < eprio(self->yield_to)) self->yield_to = t;
+}
+// At SVC return: give the core straight to that thread (it takes it without queueing), then wait for it again
+static void core_handoff_to(thr_t *self) {
+    thr_t *t = self->yield_to; self->yield_to = NULL;
+    int c = t_core_held; if (c < 0 || !t) return;
+    pthread_mutex_lock(&g_core[c].mu);
+    int ok = g_core[c].holder == self && t->ccore < 0 && !t->exited;   // not already queued for the core (then a normal release hands it over by priority)
+    if (ok) g_core[c].holder = t;
+    else core_handoff(c);
+    pthread_mutex_unlock(&g_core[c].mu);
+    t_core_held = -1;
+    core_acquire(self);
+}
 // The host's own heavy work on a guest thread (NVN submit / present: translating to Metal; on hardware the GPU's business) runs without the guest core, so the core's
 // other threads are not held up by it (hle_nvn.c gfx_enter / gfx_leave, outermost level only)
-static __thread int t_core_parked;
-void dm_core_host_work(int enter) {
+static __thread int t_core_parked, t_core_off;
+void dm_core_host_work(int enter) {   // nests: the core is given up at the outermost enter and taken back at the matching leave
     thr_t *t = pthread_getspecific(g_keythr); if (!t || !core_lock_on()) return;
-    if (enter) { if (t_core_held >= 0) { core_release(); t_core_parked = 1; } }
-    else if (t_core_parked) { t_core_parked = 0; core_acquire(t); }
+    if (enter) { if (!t_core_off++ && t_core_held >= 0) { core_release(); t_core_parked = 1; } }
+    else if (t_core_off && !--t_core_off && t_core_parked) { t_core_parked = 0; core_acquire(t); }
 }   // inside an SVC: the wrapper takes the core back on the way out
 // Preemption signal: a holder in guest code gives the core up on the spot and waits for it again in priority order (guest code holds no host locks); in host code
 // the request stays pending until its next SVC
@@ -367,8 +412,21 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
     }
 }
 
+// DM_STALL_DUMP=ms (diagnostic): when no frame has been presented for that long during play, dump every guest thread's state while the stall is still going on (3 times at most)
+void svc_thread_dump(void);
+static void *stall_main(void *arg) {
+    uint64_t lim = (uint64_t)(uintptr_t)arg * 1000000ull, last_f = 0, last_t = now_ns(); int dumps = 0;
+    for (;;) {
+        struct timespec ts = {0, 20000000}; nanosleep(&ts, 0);
+        uint64_t f = dm_nvn_frame_count(), t = now_ns();
+        if (f != last_f) { last_f = f; last_t = t; continue; }
+        if (f > 1000 && t - last_t > lim && dumps < 3) { dumps++; LOG("[卡顿] 帧 %llu 已 %.0f ms 没出图，现场：", (unsigned long long)f, (t - last_t) / 1e6); svc_thread_dump(); last_t = t + 10000000000ull; }
+    }
+    return NULL;
+}
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
+    { const char *e = getenv("DM_STALL_DUMP"); pthread_t th; if (e && atoi(e) > 0 && !pthread_create(&th, NULL, stall_main, (void *)(uintptr_t)atoi(e))) pthread_detach(th); }
     pthread_key_create(&g_keythr, NULL);
     pause_install();
     thr_t *t = calloc(1, sizeof *t);
@@ -600,9 +658,22 @@ static void sleep_precise(uint64_t dl) {
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
 }
+static void core_report(void) {   // DM_CORE_LOCK: every 5 s, who waited for a core and whom they waited on
+    static uint64_t last; uint64_t now = now_ns(); if (now - last < 5000000000ull) return; last = now;
+    pthread_mutex_lock(&G);
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (!t->cw_n && !t->cb_ns) continue;
+        char nb[64]; LOG("[核] %#x %-24s p%d c%d 等核 %.1f ms / %llu 次（最长 %.2f ms）挡住别人 %.1f ms 被抢占 %llu", t->handle, thr_name(t, nb, sizeof nb), t->prio, t->core,
+            t->cw_ns / 1e6, (unsigned long long)t->cw_n, t->cw_max / 1e6, t->cb_ns / 1e6, (unsigned long long)t->cp_n);
+        t->cw_ns = t->cw_n = t->cw_max = t->cb_ns = t->cp_n = 0;
+    }
+    pthread_mutex_unlock(&G);
+}
 int svc_thread(int num, uint64_t *regs) {
     int r = svc_thread_impl(num, regs);
     thr_t *me = pthread_getspecific(g_keythr);
+    { static int st = -1; if (st < 0) st = getenv("DM_CORE_STATS") != NULL; if (st && me && me->handle == 0x1001 && core_lock_on()) core_report(); }   // DM_CORE_STATS: core wait statistics every 5 s
+    if (me && me->yield_to) { if (t_core_lost) me->yield_to = NULL; else core_handoff_to(me); }
     if (t_core_lost && me) { t_core_lost = 0; core_acquire(me); }
     else if (me && t_core_held >= 0 && atomic_load(&me->cpreempt)) { core_release(); core_acquire(me); }
     static int on = -1; if (on < 0) { const char *e = getenv("DM_PREEMPT"); on = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
@@ -638,7 +709,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x09: {  // StartThread(w0)
         pthread_mutex_lock(&G);
         thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
-        if (t) { t->started = 1; pthread_cond_signal(&t->cv); }
+        if (t) { t->started = 1; pthread_cond_signal(&t->cv); core_note_wake(cur(), t); }
         pthread_mutex_unlock(&G);
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
     }

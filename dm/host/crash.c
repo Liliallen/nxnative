@@ -147,7 +147,8 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     }
     funlockfile(stderr);
 #if !TARGET_OS_IPHONE
-    { void hlecount_dump(void); hlecount_dump(); }   // DM_HLECOUNT: the counts are also wanted from runs that crash or hit the time limit
+    { void hlecount_dump(void); hlecount_dump(); }
+    { extern void probe_crash_dump(ucontext_t *) __attribute__((weak)); if (probe_crash_dump) probe_crash_dump(uc); }   // Mac probes: event history of the objects in the crash registers   // DM_HLECOUNT: the counts are also wanted from runs that crash or hit the time limit
 #endif
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
@@ -171,7 +172,8 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     {   uint64_t sp = uc->uc_mcontext->__ss.__sp; int n = 0;
         fprintf(stderr, "[dm] 栈扫描 sp=%#llx:", (unsigned long long)sp);
         for (int i = -32; i < 512 && n < 24 && sp && !(sp & 7); i++) {
-            uint64_t v = ((uint64_t *)sp)[i]; Dl_info di;
+            uint64_t v; vm_size_t got = 0; Dl_info di;
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)((uint64_t *)sp + i), 8, (vm_address_t)&v, &got) || got != 8) break;   // the end of the stack mapping: reading on faulted inside the handler and hung the run
             if (v < 0x100000000ull || (v & 3)) continue;
             int mod = -1; for (int k = 0; k < g_nmod; k++) { uint64_t b = (uint64_t)(uintptr_t)g_mod[k].base; if (v >= b && v < b + g_mod[k].size) mod = k; }
             if (mod >= 0) { fprintf(stderr, " [%+d]%s+%#llx", i * 8, g_mod[mod].name, (unsigned long long)(v - (uint64_t)(uintptr_t)g_mod[mod].base)); n++; }

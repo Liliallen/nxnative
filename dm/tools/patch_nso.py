@@ -1027,6 +1027,46 @@ if RULE_RUN:
         0x52800062, 0x51000849, B(a+20,0x6c6584)],
         'touch-run-v4：原通用合法移动仅player0请求Walk2规范为Run3，非player与其它请求保原，w8/原资格不改')
 
+# Breath of the Wild 1.6.0 (main 8e9978d5…): job group claim spinlock backoff. A job group whose first job must be taken by the core-0 worker makes the other workers
+# take the claim lock, see the cursor still at 0, release it and take it again at once (main+0x12c0ed0, and main+0x12c0f74 for claims without a worker context); the core-0
+# worker (the main thread) has to win the lock in the few instructions it is free. On Apple's cores that took hundreds of milliseconds (frames of 0.3-1 s); a pause of
+# about a microsecond (ISBs) before the retry leaves it the lock. The retry branch goes through a patch-area block; the counter register is dead at that point
+def botw160_claim_backoff():
+    def tb(op, at, target, bit, r): d = (target - at) >> 2; assert -(1 << 13) <= d < (1 << 13); return op | (bit << 19) | ((d & 0x3fff) << 5) | r
+    for site, flag, retry, cont, ctr in ((0x12c0ed0, 14, 0x12c0e48, 0x12c0ed4, 15), (0x12c0f74, 12, 0x12c0ef8, 0x12c0f78, 13)):
+        old = struct.unpack_from('<I', IMG, site)[0]
+        assert old == tb(0x37000000, site, retry, 0, flag), f'认领自旋原字不符 | claim retry word mismatch {site:#x}: {old:#010x}'
+        a = here()
+        for w in (tb(0x36000000, a, a + 24, 0, flag),                 # tbz wF, #0, -> continue (no retry)
+                  0x52800000 | (100 << 5) | ctr,                      # movz wC, #100
+                  0xD5033FDF,                                         # isb
+                  0x71000400 | (ctr << 5) | ctr,                      # subs wC, wC, #1
+                  0x54000001 | ((((a + 8) - (a + 16)) >> 2 & 0x7ffff) << 5),   # b.ne isb
+                  B(a + 20, retry), B(a + 24, cont)):
+            emit(w)
+        new = B(site, a); struct.pack_into('<I', IMG, site, new)
+        cuts.append((site, struct.pack('<I', old).hex(), struct.pack('<I', new).hex(), 'BotW 1.6.0 job claim retry backoff', '全'))
+    print(f'{NAME}：BotW 1.6.0 任务认领自旋退避 2 处 | job claim backoff at 2 sites')
+if NAME == 'main' and BUILD_ID == '8e9978d50bdd20b4c8395a106c27ffde' and os.environ.get('DM_BOTW_CLAIM_BACKOFF', '1') != '0':
+    botw160_claim_backoff()
+
+# Ordered exclusives: every LDXR / STXR / LDXP / STXP (any size) becomes LDAXR / STLXR / LDAXP / STLXP (bit 15). Games build spinlocks from plain exclusives with no acquire
+# barrier (Breath of the Wild 1.6.0's job groups claim work under such a lock at main+0x12c0e58, then read the claim cursor); Cortex-A57 practically never lets that load
+# pass the exclusive, Apple's cores do, and two threads claimed the same work (double releases, uniform block lists rebuilt twice). Acquire / release cost little there.
+# Done last, so the rewrites above still see the original mnemonics; the patch area's copies of exclusive windows are covered too. DM_ORDERED_EXCL=0 turns it off
+def order_exclusives(buf, lo, hi):
+    n = 0
+    for o in range(lo, hi - 3, 4):
+        w = struct.unpack_from('<I', buf, o)[0]
+        if (w >> 24) & 0x3F != 0x08 or (w >> 23) & 1 or (w >> 15) & 1: continue
+        ins = next(md.disasm(bytes(buf[o:o + 4]), o), None)
+        if ins is None or ins.mnemonic not in ('ldxr', 'ldxrb', 'ldxrh', 'ldxp', 'stxr', 'stxrb', 'stxrh', 'stxp'): continue
+        struct.pack_into('<I', buf, o, w | 1 << 15); n += 1
+    return n
+if os.environ.get('DM_ORDERED_EXCL', '1') != '0':
+    n_ex = order_exclusives(IMG, 0, TEXT_END) + order_exclusives(patch, 0, len(patch))
+    print(f'{NAME}：独占访问加上获取/释放语义 {n_ex} 处 | exclusives made acquire / release: {n_ex}')
+
 os.makedirs(outdir, exist_ok=True)
 P = lambda ext: os.path.join(outdir, f'{NAME}.{ext}')
 if FAR:   # patch area before the base: file = text + ro + data (padded to 16K) + patch area
