@@ -617,7 +617,10 @@ static id<MTL4ComputeCommandEncoder> blit(void) {
     return e;
 }
 
+static int ub_rename(const void *data, uint64_t dst, uint64_t n);
+static void ren_flush(uint64_t lo, uint64_t hi);
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
+    ren_flush(dst, dst + n); ren_flush(src, src + n);
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
     void *sb, *db; uint64_t so, dof;
     if (!mtl_addr(src, n, &sb, &so) || !mtl_addr(dst, n, &db, &dof))
@@ -631,6 +634,8 @@ static id<MTLBuffer> g_ubs_buf; static size_t g_ubs_off, g_ubs_size;
 void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
     if (!n) return;
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
+    if (ub_rename(data, dst, n)) return;   // into a new version of the bound uniform buffer: no blit, the render pass goes on
+    ren_flush(dst, dst + n);
     void *db; uint64_t dof;
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("uniform 更新目标不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
     size_t need = (n + 15u) & ~(size_t)15u;
@@ -649,6 +654,7 @@ void mtl_sub_update(const void *data, uint64_t dst, uint64_t n) {
 // In-order buffer fill within the submission: all four bytes equal → fillBuffer; otherwise copied in chunks from a 64 KiB pattern buffer
 void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     if (!n) return;
+    ren_flush(dst, dst + n);
     if (g_npend < PEND_MAX) { g_pend_lo[g_npend] = dst; g_pend_hi[g_npend++] = dst + n; } else g_pend_over = 1;
     void *db; uint64_t dof;
     if (!mtl_addr(dst, n, &db, &dof)) MDIE("缓冲填充地址不在任何内存池内 dst=%#llx n=%#llx", (unsigned long long)dst, (unsigned long long)n);
@@ -793,6 +799,7 @@ static const char *cctx_snap(void);   // What is in this submission (printed int
 uint64_t mtl_sub_commit(void) {
     defer_fallback();   // Deferred merged pass: at the end of the submission there are still P draws not replayed (the normal path never gets here)
     rp_flush();
+    ren_flush(0, ~0ull);   // renamed uniform buffers: their last versions go back into the pools, after every draw of the submission
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush();
     uint64_t fence = ++g_fence;
@@ -3143,6 +3150,53 @@ static __unsafe_unretained id<MTLTexture> g_fb_src[4]; static __strong id<MTLTex
 static uint8_t g_args_dirty[6] = {1, 1, 1, 1, 1, 1};
 static uint64_t g_args_reg_seen, g_args_dirty_seen;
 static inline void args_dirty_all(void) { memset(g_args_dirty, 1, sizeof g_args_dirty); }
+// ---------- Uniform buffer renaming (DM_NVN_UB_RENAME, default on; 0 = off) ----------
+// UpdateUniformBuffer is an in-order write: earlier draws see the old bytes, later ones the new. Done as a buffer copy it has to end the render pass first, and Breath of the Wild
+// updates 16 bytes between single draws into the same small targets: about 230 render passes of one draw each per frame, a fixed GPU cost (TBDR pass setup, attachment loads
+// and stores, barriers) that does not shrink with the resolution (M1 iPad: 48 ms per frame docked, 46 ms handheld). Instead the bound uniform range containing the update is
+// copied into this submission's arena with the update applied (from the previous version when there is one), and later draws bind that copy. The last version is copied
+// back into the pool at the end of the submission, or before any other write to that range (copy, fill, an update that cannot be renamed), so memory ends as on hardware
+typedef struct { uint64_t lo, hi; __unsafe_unretained id<MTLBuffer> buf; size_t off; } ub_ren_t;   // the arena keeps buf alive until the submission completes
+enum { REN_MAX = 64, REN_MAX_SPAN = 0x10000 };
+static ub_ren_t g_ren[REN_MAX]; static int g_nren; static uint64_t g_ren_n, g_ren_flushes;
+static int ren_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UB_RENAME"); v = e ? atoi(e) : 1; MLOG("uniform 缓冲改名：%s（DM_NVN_UB_RENAME）", v ? "开" : "关"); } return v; }
+static ub_ren_t *ren_find(uint64_t a, uint64_t n) { for (int i = 0; i < g_nren; i++) if (a >= g_ren[i].lo && a + n <= g_ren[i].hi) return &g_ren[i]; return NULL; }
+static void ren_flush(uint64_t lo, uint64_t hi) {   // copy the versions overlapping [lo, hi) back into their pools and drop them
+    for (int i = 0; i < g_nren; ) {
+        ub_ren_t *e = &g_ren[i];
+        if (!(e->lo < hi && lo < e->hi)) { i++; continue; }
+        void *pb; uint64_t po;
+        if (mtl_addr(e->lo, e->hi - e->lo, &pb, &po)) enc_b_copy_buffer(blit_buf(0, 0, e->lo, e->hi), e->buf, e->off, (__bridge id<MTLBuffer>)pb, po, e->hi - e->lo);
+        g_ren_flushes++; g_ren[i] = g_ren[--g_nren];
+    }
+}
+static int ub_rename(const void *data, uint64_t dst, uint64_t n) {
+    if (!ren_on() || !g_cb) return 0;
+    ub_ren_t *e = ren_find(dst, n); uint64_t lo = 0, hi = 0;
+    if (e) { lo = e->lo; hi = e->hi; }
+    else {
+        for (int st = 0; st < 6 && !hi; st++) for (int r = 0; r < 16; r++) { const p_bind_buf *u = &S.ubo[st][r];
+            if (u->addr && u->size && dst >= u->addr && dst + n <= u->addr + u->size) { lo = u->addr; hi = u->addr + u->size; break; } }
+        if (!hi || hi - lo > REN_MAX_SPAN || g_nren == REN_MAX) return 0;
+        for (int i = 0; i < g_nren; i++) if (g_ren[i].lo < hi && lo < g_ren[i].hi) return 0;   // overlaps another version: the ordered copy path (the caller flushes it)
+    }
+    const uint8_t *src;
+    if (e) src = (const uint8_t *)e->buf.contents + e->off;
+    else { void *pb; uint64_t po; if (!mtl_addr(lo, hi - lo, &pb, &po)) return 0; src = (const uint8_t *)((__bridge id<MTLBuffer>)pb).contents + po; }
+    id<MTLBuffer> nb; size_t no = arena_alloc(hi - lo, &nb);
+    uint8_t *d = (uint8_t *)nb.contents + no; memcpy(d, src, hi - lo); memcpy(d + (dst - lo), data, n);
+    if (!e) { e = &g_ren[g_nren++]; e->lo = lo; e->hi = hi; }
+    e->buf = nb; e->off = no; g_ren_n++;
+    for (int st = 0; st < 6; st++) g_args_dirty[st] = 1;
+    return 1;
+}
+// A uniform binding inside a renamed range reads the current version (whole binding inside it; otherwise the pool, as before)
+static int ren_bind(const p_bind_buf *u, void **mb, uint64_t *gpu) {
+    if (!g_nren) return 0;
+    ub_ren_t *e = ren_find(u->addr, u->size ? u->size : 1); if (!e) return 0;
+    *mb = (__bridge void *)e->buf; *gpu = e->buf.gpuAddress + e->off + (u->addr - e->lo); return 1;
+}
+
 static inline void args_sync_dirty(void) {
     uint64_t reg = g_reg_gen, dirty = nvn_dirty_now();
     if (reg != g_args_reg_seen || dirty != g_args_dirty_seen) {
@@ -3188,6 +3242,7 @@ static uint32_t ubo_handle(int stage, int reg, int off) {
     if (stage < 0 || stage >= 6 || reg < 0 || reg >= 16) return 0;
     const p_bind_buf *u = &S.ubo[stage][reg];
     if (!u->addr || (uint64_t)off + 4 > u->size) return 0;
+    { ub_ren_t *e = ren_find(u->addr + off, 4); if (e) { uint32_t h; memcpy(&h, (const uint8_t *)e->buf.contents + e->off + (u->addr + off - e->lo), 4); return h; } }   // the renamed version is the current value
     if (pend_hits(u->addr + off, 4)) RED_ONCE(47, "无绑定句柄所在的 uniform 缓冲（阶段 %d 槽 %d +%#x）本提交里有 GPU 侧写入：读的是当前值", stage, reg, off);
     void *mb; uint64_t mo; const uint8_t *base;
     if (!mtl_addr(u->addr + off, 4, &mb, &mo) || !(base = [(__bridge id<MTLBuffer>)mb contents])) return 0;
@@ -3219,8 +3274,9 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             const p_bind_buf *u = reg < 16 ? &S.ubo[nvn_stage][reg] : NULL;
             void *mb; uint64_t mo, gpu;
             if (!u || !u->addr || !mtl_gpu_addr(u->addr, 1, &mb, &mo, &gpu)) { RED_ONCE(16, "阶段 %d cb%d 没有绑定 uniform 缓冲", nvn_stage, reg); continue; }
+            int renamed = ren_bind(u, &mb, &gpu);
             use_rec("buf", u->addr, u->size, 0, NULL);
-            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
+            if (nvn_stage == 0 && reg == 0 && g_ui_moff != 0 && !renamed) { uint64_t pg = ui_mat_patch(u, mb, mo); if (pg) gpu = pg; }
             if (bl) {
                 PD("B %llu st%d cb reg%d addr=%#llx size=%llu pool=%#llx+%#llx f=%g,%g,%g,%g", g_stat_pass, nvn_stage, reg, (unsigned long long)u->addr, (unsigned long long)u->size,
                    (unsigned long long)(u->addr - mo), (unsigned long long)mo, ((float *)u->addr)[0], ((float *)u->addr)[1], ((float *)u->addr)[2], ((float *)u->addr)[3]);
@@ -3277,7 +3333,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         } else if (b->kind == NVN_RB_SBUFP || b->kind == NVN_RB_UBOP) {   // B: storage buffers / compute-stage uniforms are device pointers; the address is taken by NVN slot
             const p_bind_buf *u = reg < 16 ? (b->kind == NVN_RB_UBOP ? &S.ubo[nvn_stage][reg] : &S.ssbo[nvn_stage][reg]) : NULL;
             void *mb; uint64_t mo, gpu;
-            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
+            if (u && u->addr && mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) { if (b->kind == NVN_RB_UBOP) ren_bind(u, &mb, &gpu); use_rec("buf", u->addr, u->size, 0, NULL); slots[aid] = gpu; USE((__bridge id<MTLBuffer>)mb, b->rw ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead); }
             else { slots[aid] = dummy_buf_gpu(); USE(dummy_buf(), MTLResourceUsageRead); }
             if (bl) PD("B %llu st%d sbufp reg%d %s addr=%#llx size=%llu %s", g_stat_pass, nvn_stage, reg, u && u->addr ? "实" : "哑", u ? (unsigned long long)u->addr : 0ull, u ? (unsigned long long)u->size : 0ull, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_C1) {      // B: the shader's own constant segment, built when the shader is fetched
@@ -6222,7 +6278,7 @@ void mtl_exec(const uint8_t *p) {
                 if (g_enc && g_fz.active && g_fz.phase == 1 && fz_reuse_op(p) && !pend && g_enc_mode != 1 && R.has_rt && tbdr_on() && rt_same(&g_fz.rt1, r)) {
                     g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); break; }
                 // Do not continue a render pass opened only for a clear; one with fewer depth / stencil attachments can be continued (check the planes before drawing)
-                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && tbdr_on() && rt_same(&R.rt, r)) { g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
+                if (g_enc && g_enc_mode != 1 && !pend && R.has_rt && (tbdr_on() || ren_on()) && rt_same(&R.rt, r)) { g_rt_merged = 1; if (!g_rt_merge_n++) MLOG("同目标续用：首例 通道 %llu", g_stat_pass); PD("M %llu 同目标续用通道", g_stat_pass); R.rt = *r; break; }
                 rp_flush(); sub_cut(); R.rt = *r; R.has_rt = 1; break;
             }
             case OP_CLEAR_COLOR: {
