@@ -6,6 +6,9 @@
 #   The app name is the game name in the base NSP's control data ($W/data/v0/control.nacp, else the one next to the RomFS), the app version is the display version in the packed game's control data (the one next to the RomFS:
 #   nx_extract saves the update's there when an update is packed, else the base game's), the bundle ID is org.nxnative.<base game title ID in lowercase> (DM_DISPLAY_NAME / DM_APP_VERSION / DM_BUNDLE_ID override them);
 #   the IPA name, code modules, RomFS marker and shader tables come from the game profile
+#   DM_SIGN_TEAM=<team ID>: sign for your own device instead (Xcode automatic signing, so Xcode must be signed in to that team; the device must be registered): the app is built signed,
+#     re-signed after the game files are added (DM_ENTITLEMENTS = an extra entitlements plist, e.g. com.apple.developer.kernel.increased-memory-limit), and left at
+#     $W/build/ios/pkg/Payload/DmIOS.app for `xcrun devicectl device install app`; no IPA is zipped. DM_IOS_CPU sets -mcpu (default apple-a18; apple-m1 for M1 / A14 devices)
 set -u
 cd "$(dirname "$0")/.." || exit 1
 IOS=$PWD; DM=$(cd .. && pwd)
@@ -62,10 +65,18 @@ if [ -f "$ICON" ]; then
 else t "no app icon ($ICON not found): the home-screen icon stays blank"; fi
 xcodegen generate -q > /dev/null || die "xcodegen"
 
-t "xcodebuild (Release, unsigned, iPhone + iPad)"
 mkdir -p "$O"
+CPU=(); [ -n "${DM_IOS_CPU:-}" ] && CPU=("OTHER_CFLAGS=\$(inherited) -mcpu=$DM_IOS_CPU")
+if [ -n "${DM_SIGN_TEAM:-}" ]; then
+  t "xcodebuild (Release, signed for team $DM_SIGN_TEAM)"
+  SIGN=(DEVELOPMENT_TEAM="$DM_SIGN_TEAM" CODE_SIGN_STYLE=Automatic -allowProvisioningUpdates)
+  [ -n "${DM_ENTITLEMENTS:-}" ] && SIGN+=(CODE_SIGN_ENTITLEMENTS="$DM_ENTITLEMENTS")
+else
+  t "xcodebuild (Release, unsigned, iPhone + iPad)"
+  SIGN=(CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=)
+fi
 xcodebuild -project DmIOS.xcodeproj -scheme DmIOS -configuration Release -destination 'generic/platform=iOS' -derivedDataPath "$DD" \
-  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build > "$O/build.log" 2>&1 \
+  "${SIGN[@]}" ${CPU[@]+"${CPU[@]}"} build > "$O/build.log" 2>&1 \
   || { grep -E 'error:' "$O/build.log" | head -20; die "xcodebuild, log $O/build.log"; }
 # When Xcode's Locations setting is a custom location, products ignore -derivedDataPath: take the actual path from this build's log
 APP=$DD/Build/Products/Release-iphoneos/DmIOS.app; [ -d "$APP" ] || APP=$(grep -o '/[^ ]*/Release-iphoneos/DmIOS\.app' "$O/build.log" | tail -1)
@@ -73,11 +84,18 @@ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app; [ -d "$APP" ] || APP=$(grep -
 
 t "assemble Payload (app + RomFS)"
 rm -rf "$O/Payload" && mkdir -p "$O/Payload" && cp -cR "$APP" "$O/Payload/DmIOS.app" || die "copy app"
-A=$O/Payload/DmIOS.app; rm -rf "$A/_CodeSignature" "$A/embedded.mobileprovision"
+A=$O/Payload/DmIOS.app; [ -n "${DM_SIGN_TEAM:-}" ] || rm -rf "$A/_CodeSignature" "$A/embedded.mobileprovision"
 cp -cR "$ROMFS" "$A/romfs" || die "copy RomFS"
 # Add-on content: the RomFS extracted from the player's DLC NSPs, one subdirectory per index (the app sets DM_AOC_DIR at launch; the host reports them as owned and mounts them from it)
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then cp -cR "$AOC" "$A/aoc" || die "copy add-on content"; t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 
+if [ -n "${DM_SIGN_TEAM:-}" ]; then
+  ID=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=\(Apple Development: .*\)/\1/p' | head -1); [ -n "$ID" ] || die "no signing identity on $APP"
+  codesign -d --entitlements :- "$APP" > "$O/ent.plist" 2> /dev/null || die "read entitlements"
+  t "re-sign with the game files: $ID"
+  codesign --force --sign "$ID" --entitlements "$O/ent.plist" --timestamp=none "$A" || die "codesign"
+  t "done: $A (install: xcrun devicectl device install app --device <UDID> \"$A\")"; exit 0
+fi
 t "zip (already-compressed game files stored, everything else deflated)"
 rm -f "$O/out.ipa"
 ( cd "$O" && zip -qry -n "$(gp zip_store)" out.ipa Payload ) || die "zip"

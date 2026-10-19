@@ -132,6 +132,10 @@ static int capture(const uint8_t *cl, int16_t *dst) {
         else if (!hist[g_sink_id & 63]) LOG("【红】audren：命令表里没有 DeviceSink（%#x 号），0x148 字节的命令有 %d 个：游戏声音出不来", g_sink_id, ncand);
     }
     const uint8_t *c = cl + 0x20;
+    { static uint64_t calls, off, none; static int nlog; calls++;   // DM_AUDREN_TRACE: how often the sink is there and enabled
+      if (getenv("DM_AUDREN_TRACE")) { const uint8_t *q = c; int found = 0, on = 0; for (uint32_t i = 0; i < ncmd && *(const uint32_t *)q == 0xcafebabeu && cmd_size(q) > 0; i++) { if (cmd_id(q) == g_sink_id) { found = 1; on = cmd_on(q); } q += cmd_size(q); }
+        if (!found) none++; else if (!on) off++;
+        if ((calls == 1 || calls == 100 || calls == 1000 || calls % 2000 == 0) && nlog++ < 30) LOG("audren 追踪：%llu 次渲染，DeviceSink 不在 %llu 次、关着 %llu 次，命令 %u 条", (unsigned long long)calls, (unsigned long long)none, (unsigned long long)off, ncmd); } }
     for (uint32_t i = 0; i < ncmd; i++) {
         uint32_t magic = *(const uint32_t *)c; int size = cmd_size(c);
         if (magic != 0xcafebabeu || size <= 0) { if (!logged++) LOG("【红】audren：命令表第 %u 条格式不对（魔数 %#x 大小 %d）", i, magic, size); return 0; }
