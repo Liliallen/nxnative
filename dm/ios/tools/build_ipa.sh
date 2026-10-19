@@ -8,7 +8,8 @@
 #   the IPA name, code modules, RomFS marker and shader tables come from the game profile
 #   DM_SIGN_TEAM=<team ID>: sign for your own device instead (Xcode automatic signing, so Xcode must be signed in to that team; the device must be registered): the app is built signed,
 #     re-signed after the game files are added (DM_ENTITLEMENTS = an extra entitlements plist, e.g. com.apple.developer.kernel.increased-memory-limit), and left at
-#     $W/build/ios/pkg/Payload/DmIOS.app for `xcrun devicectl device install app`; no IPA is zipped. DM_IOS_CPU sets -mcpu (default apple-a18; apple-m1 for M1 / A14 devices)
+#     $W/build/ios/pkg/Payload/DmIOS.app for `xcrun devicectl device install app`; no IPA is zipped. DM_NO_ROMFS=1 leaves the game files out (copy them once to
+#     the app's Documents/romfs, which main.m prefers; later app updates are then small). DM_IOS_CPU sets -mcpu (default apple-a18; apple-m1 for M1 / A14 devices)
 set -u
 cd "$(dirname "$0")/.." || exit 1
 IOS=$PWD; DM=$(cd .. && pwd)
@@ -85,7 +86,8 @@ APP=$DD/Build/Products/Release-iphoneos/DmIOS.app; [ -d "$APP" ] || APP=$(grep -
 t "assemble Payload (app + RomFS)"
 rm -rf "$O/Payload" && mkdir -p "$O/Payload" && cp -cR "$APP" "$O/Payload/DmIOS.app" || die "copy app"
 A=$O/Payload/DmIOS.app; [ -n "${DM_SIGN_TEAM:-}" ] || rm -rf "$A/_CodeSignature" "$A/embedded.mobileprovision"
-cp -cR "$ROMFS" "$A/romfs" || die "copy RomFS"
+if [ -n "${DM_NO_ROMFS:-}" ]; then t "no RomFS in the app (DM_NO_ROMFS): the game files go to Documents/romfs on the device"
+else cp -cR "$ROMFS" "$A/romfs" || die "copy RomFS"; fi
 # Add-on content: the RomFS extracted from the player's DLC NSPs, one subdirectory per index (the app sets DM_AOC_DIR at launch; the host reports them as owned and mounts them from it)
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then cp -cR "$AOC" "$A/aoc" || die "copy add-on content"; t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 
