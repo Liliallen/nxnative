@@ -24,6 +24,8 @@ pad_layout	full
 gpu_timestamps	segment
 # The engine keeps unlocked per-core state indexed by GetCurrentCoreNumber (1.6.0: 2,845 call sites, per-core bump arenas): one running thread per core, as on Horizon
 core_lock	on
+# TBDR pass optimizations: GPU 16 -> 13 ms per frame on the Mac with uniform renaming, same picture (Great Plateau)
+tbdr	on
 # 1.6.0 is built with SDK 7.3.2 (1.9.0: SDK 20): NVN API 53.x and the shared font handed over as a plain TTF, as for the
 # other SDK <= 10 games
 device_api	53.313
