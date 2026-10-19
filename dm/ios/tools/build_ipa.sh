@@ -90,7 +90,9 @@ cp -cR "$ROMFS" "$A/romfs" || die "copy RomFS"
 if [ -n "$AOC" ] && [ -d "$AOC" ]; then cp -cR "$AOC" "$A/aoc" || die "copy add-on content"; t "add-on content: $(ls "$AOC" | tr '\n' ' ')"; fi
 
 if [ -n "${DM_SIGN_TEAM:-}" ]; then
-  ID=$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=\(Apple Development: .*\)/\1/p' | head -1); [ -n "$ID" ] || die "no signing identity on $APP"
+  # the identity by the SHA-1 of the certificate Xcode signed with (two identities may share a name)
+  ( cd "$O" && rm -f codesign0 && codesign -d --extract-certificates "$APP" 2> /dev/null ) && [ -f "$O/codesign0" ] || die "no signing certificate on $APP"
+  ID=$(openssl x509 -inform DER -in "$O/codesign0" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')
   codesign -d --entitlements :- "$APP" > "$O/ent.plist" 2> /dev/null || die "read entitlements"
   t "re-sign with the game files: $ID"
   codesign --force --sign "$ID" --entitlements "$O/ent.plist" --timestamp=none "$A" || die "codesign"
